@@ -1,9 +1,6 @@
 # MoltenVK runtime build
 /Package
 
-# MoltenVK dependencies
-/External
-
 # Vulkan CTS testing artifacts
 /Scripts/TestResults.qpa
 /Scripts/shadercache.bin
