@@ -1,0 +1,68 @@
+# Copyright (c) 2026 Huawei Device Co., Ltd.
+# MoltenVK iOS: action always produces target_gen_dir/libMoltenVK.a so ninja has a
+# rule; prebuilt copies that into moltenvk_ios target_out_dir as libMoltenVK.a.
+#
+# moltenvk_ios_build_enabled=false + no manual .a => action fails with clear message.
+# Manual .a path: moltenvk_ios_prebuilt_a (repo path) is copied into gen by script.
+
+import("//build/ohos.gni")
+
+declare_args() {
+  moltenvk_ios_prebuilt_a =
+      "//third_party/MoltenVK/prebuilt/ios/libMoltenVK.a"
+  moltenvk_ios_build_enabled = true
+  moltenvk_ios_rebuild_stamp = ""
+}
+
+# Stamp file only when build enabled or stamp non-empty — still write when empty so
+# changing stamp at gn gen invalidates action when build enabled.
+_moltenvk_stamp_file =
+    "${root_build_dir}/build_configs/moltenvk_ios_rebuild_stamp.txt"
+write_file(_moltenvk_stamp_file, moltenvk_ios_rebuild_stamp)
+
+_moltenvk_root = "//third_party/MoltenVK"
+_moltenvk_root_rebased = rebase_path(_moltenvk_root, root_build_dir)
+_manual_prebuilt_rebased = rebase_path(moltenvk_ios_prebuilt_a, root_build_dir)
+_build_flag = "0"
+if (moltenvk_ios_build_enabled) {
+  _build_flag = "1"
+}
+
+action("moltenvk_ios_build") {
+  script = "//third_party/MoltenVK/build_moltenvk_ios.sh"
+  inputs = [
+    "//third_party/MoltenVK/build_moltenvk_ios.sh",
+    "//third_party/MoltenVK/build_external_deps_only.sh",
+    "//third_party/MoltenVK/Makefile",
+    _moltenvk_stamp_file,
+  ]
+  outputs = [ "${target_gen_dir}/libMoltenVK.a" ]
+  args = [
+    _moltenvk_root_rebased,
+    rebase_path("${target_gen_dir}/libMoltenVK.a", root_build_dir),
+    moltenvk_ios_rebuild_stamp,
+    _build_flag,
+    _manual_prebuilt_rebased,
+  ]
+}
+
+config("moltenvk_public_config") {
+  include_dirs = [
+    "//third_party/MoltenVK/MoltenVK/MoltenVK/API",
+  ]
+}
+
+# Copy from action output into stable out path; __config libs point at _copy_output.
+ohos_prebuilt_static_library("moltenvk_ios") {
+  source = get_label_info(":moltenvk_ios_build", "target_gen_dir") +
+           "/libMoltenVK.a"
+  output = "libMoltenVK.a"
+  deps = [ ":moltenvk_ios_build" ]
+  public_configs = [ ":moltenvk_public_config" ]
+  part_name = "build_framework"
+  subsystem_name = "build"
+}
+
+group("moltenvk_ios_deps") {
+  public_deps = [ ":moltenvk_ios" ]
+}
