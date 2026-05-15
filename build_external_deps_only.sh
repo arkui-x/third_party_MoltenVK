@@ -59,6 +59,7 @@ XC_USE_BCKGND=""
 XC_USE_ASAN="NO"
 XC_USE_TSAN="NO"
 XC_USE_UBSAN="NO"
+BLD_SPV_TLS=""
 export KEEP_CACHE=""
 
 while (($#)); do
@@ -142,6 +143,10 @@ while (($#)); do
 		XC_BUILD_VERBOSITY=""
 		shift
 		;;
+	--build-spirv-tools)
+		BLD_SPV_TLS="Y"
+		shift
+		;;
 	*)
 		echo "Error: unsupported option: $1" >&2
 		echo "See header in build_external_deps_only.sh for supported flags." >&2
@@ -153,6 +158,56 @@ done
 echo
 echo "========== Build-only: ExternalDependencies (no git updates) at $(date +"%r") =========="
 echo
+
+# Match fetchDependencies SPIRV-Tools step: pre-generated tables/headers in build/, or full CMake build.
+needs_spirv_tools_zip_prep() {
+	if [[ -n "$BLD_NONE" ]]; then
+		return 1
+	fi
+	[[ -n "$BLD_MACOS" || -n "$BLD_IOS" || -n "$BLD_IOS_SIM" || -n "$BLD_MAC_CAT" || -n "$BLD_TVOS" || -n "$BLD_TVOS_SIM" || -n "$BLD_VISIONOS" || -n "$BLD_VISIONOS_SIM" ]]
+}
+
+prepare_spirv_tools_build_artifacts() {
+	local spv_root="${SCRIPT_DIR}/${EXT_DIR}/SPIRV-Tools"
+	if [[ ! -d "$spv_root" ]]; then
+		echo "Error: missing ${spv_root}" >&2
+		exit 1
+	fi
+	if [[ "$BLD_SPV_TLS" == "Y" ]]; then
+		echo "========== SPIRV-Tools: CMake host build (same as fetchDependencies --build-spirv-tools) =========="
+		if [[ ! -d "${spv_root}/external/spirv-headers/include" ]]; then
+			echo "Error: ${spv_root}/external/spirv-headers/include missing; init SPIRV-Headers under SPIRV-Tools first." >&2
+			exit 1
+		fi
+		mkdir -p "${spv_root}/build"
+		pushd "${spv_root}/build" >/dev/null
+		if command -v ninja >/dev/null 2>&1; then
+			cmake -G Ninja -D CMAKE_BUILD_TYPE=Release -D CMAKE_INSTALL_PREFIX=install ..
+			ninja
+		else
+			cmake -D CMAKE_BUILD_TYPE=Release -D CMAKE_INSTALL_PREFIX=install ..
+			make -j "$(sysctl -n hw.activecpu 2>/dev/null || echo 4)"
+		fi
+		popd >/dev/null
+		return 0
+	fi
+	if ! needs_spirv_tools_zip_prep; then
+		return 0
+	fi
+	local zip_path="${SCRIPT_DIR}/Templates/spirv-tools/build.zip"
+	if [[ ! -f "$zip_path" ]]; then
+		echo "Error: missing ${zip_path}; cannot unpack SPIRV-Tools generated headers." >&2
+		echo "    Install MoltenVK Templates or pass --build-spirv-tools (CMake + spirv-headers)." >&2
+		exit 1
+	fi
+	echo "========== SPIRV-Tools: unzip pre-generated build/ (same as fetchDependencies default) =========="
+	unzip -o -q -d "${spv_root}" "$zip_path"
+	rm -rf "${spv_root}/__MACOSX"
+}
+
+if [[ "$BLD_SPV_TLS" == "Y" ]] || needs_spirv_tools_zip_prep; then
+	prepare_spirv_tools_build_artifacts
+fi
 
 execute_xcodebuild_command() {
 	if [[ -n "${XCPRETTY}" ]]; then
