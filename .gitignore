@@ -1,5 +1,6 @@
 # MoltenVK runtime build
 /Package
+.moltenvk_global_build.lock/
 
 # Vulkan CTS testing artifacts
 /Scripts/TestResults.qpa

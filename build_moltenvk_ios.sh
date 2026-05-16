@@ -14,6 +14,10 @@
 
 # Produces libMoltenVK.a at OUT_LIB (GN action output path).
 # Args: MOLTENVK_ROOT OUT_LIB REBUILD_STAMP BUILD_ENABLED MANUAL_PREBUILT_PATH
+#       TARGET_TYPE TARGET_CPU
+# TARGET_TYPE: "device" (default) | "simulator"
+# TARGET_CPU: "arm64" | "x64" (from GN current_cpu; used to lipo simulator fat lib)
+# REBUILD_STAMP: use "-" when empty (never pass "" — shell drops empty argv).
 # Paths from GN/rebase_path are often relative to ninja cwd — we normalize to absolute
 # before any cd so cp/mkdir always target the correct files.
 set -e
@@ -25,14 +29,19 @@ OUT_LIB="$2"
 REBUILD_STAMP="$3"
 BUILD_ENABLED="$4"
 MANUAL_PREBUILT="$5"
+TARGET_TYPE="${6:-device}"
+TARGET_CPU="${7:-arm64}"
+if [[ "$REBUILD_STAMP" == "-" ]]; then
+  REBUILD_STAMP=""
+fi
 
 # Output to terminal (stderr + /dev/tty) and append to root_build_dir/build.log.
 TTY_AVAILABLE=
 [[ -w /dev/tty ]] && TTY_AVAILABLE=1
 log() {
-  local msg="[MoltenVK] $*"
+  local msg="[MoltenVK-$TARGET_TYPE] $*"
   echo "$msg" >&2
-  [[ -n "$TTY_AVAILABLE" ]] && echo "$msg" >/dev/tty
+  [[ -n "$TTY_AVAILABLE" ]] && echo "$msg" >/dev/tty 2>/dev/null || true
   [[ -n "$BUILD_LOG" && -w "$BUILD_LOG" ]] 2>/dev/null && echo "$msg" >>"$BUILD_LOG"
 }
 
@@ -57,61 +66,131 @@ _abs() {
 OUT_LIB="$(_abs "$OUT_LIB")"
 MANUAL_PREBUILT="$(_abs "$MANUAL_PREBUILT")"
 
-# build.log is under root_build_dir; ninja cwd is root_build_dir when action runs.
+# Build log location
 BUILD_LOG="$(pwd)/build.log"
+
+# Global lock: GN pool is per-toolchain; multiple ios_clang_* jobs share one
+# MoltenVK tree and xcodebuild DerivedData under External/build/.
+MOLTENVK_GLOBAL_LOCK_DIR="${_SCRIPT_DIR}/.moltenvk_global_build.lock"
+MOLTENVK_LOCK_MAX_WAIT_SEC=7200
+MOLTENVK_LOCK_POLL_SEC=2
+
+_acquire_moltenvk_global_lock() {
+  local waited=0
+  while true; do
+    if mkdir "$MOLTENVK_GLOBAL_LOCK_DIR" 2>/dev/null; then
+      echo $$ >"$MOLTENVK_GLOBAL_LOCK_DIR/pid"
+      return 0
+    fi
+    local holder_pid
+    holder_pid="$(cat "$MOLTENVK_GLOBAL_LOCK_DIR/pid" 2>/dev/null || true)"
+    if [[ -n "$holder_pid" ]] && kill -0 "$holder_pid" 2>/dev/null; then
+      :
+    else
+      log "Removing stale MoltenVK global lock (pid=${holder_pid:-unknown})"
+      rm -rf "$MOLTENVK_GLOBAL_LOCK_DIR"
+      continue
+    fi
+    if (( waited == 0 || waited % 30 == 0 )); then
+      log "Waiting for global MoltenVK build lock (holder pid=$holder_pid)..."
+    fi
+    sleep "$MOLTENVK_LOCK_POLL_SEC"
+    waited=$((waited + MOLTENVK_LOCK_POLL_SEC))
+    if (( waited >= MOLTENVK_LOCK_MAX_WAIT_SEC )); then
+      log "Timeout (${MOLTENVK_LOCK_MAX_WAIT_SEC}s) waiting for global MoltenVK build lock"
+      exit 1
+    fi
+  done
+}
+
+_release_moltenvk_global_lock() {
+  rm -f "$MOLTENVK_GLOBAL_LOCK_DIR/pid"
+  rmdir "$MOLTENVK_GLOBAL_LOCK_DIR" 2>/dev/null || true
+}
+
+# Simulator xcframework slice is fat (arm64 + x86_64); each toolchain needs one arch.
+_copy_moltenvk_out_lib() {
+  local src="$1"
+  local lipo_arch="$2"
+  if [[ -z "$lipo_arch" ]]; then
+    cp -f "$src" "$OUT_LIB"
+    return
+  fi
+  if ! lipo -info "$src" 2>/dev/null | grep -q "$lipo_arch"; then
+    log "Architecture $lipo_arch not in $src: $(lipo -info "$src" 2>&1)"
+    exit 1
+  fi
+  lipo -thin "$lipo_arch" "$src" -output "$OUT_LIB"
+}
 
 mkdir -p "$(dirname "$OUT_LIB")"
 
-# Force rebuild or auto build
-if [[ "$BUILD_ENABLED" == "1" || -n "$REBUILD_STAMP" ]]; then
-  cd "$MOLTENVK_ROOT"
-  if [[ ! -f "Makefile" || ! -d "MoltenVKPackaging.xcodeproj" ]]; then
-    log "MoltenVK root invalid: $MOLTENVK_ROOT"
-    exit 1
+# If build is not enabled, just use prebuilt
+if [[ "$BUILD_ENABLED" != "1" && -z "$REBUILD_STAMP" ]]; then
+  if [[ -f "$MANUAL_PREBUILT" ]]; then
+    cp -f "$MANUAL_PREBUILT" "$OUT_LIB"
+    log "Using manual prebuilt $MANUAL_PREBUILT -> $OUT_LIB"
+    exit 0
   fi
-
-  _tee_args=()
-  [[ -n "$BUILD_LOG" ]] && _tee_args+=(-a "$BUILD_LOG")
-  [[ -n "$TTY_AVAILABLE" ]] && _tee_args+=(/dev/tty)
-
-  if [[ ! -f "./build_external_deps_only.sh" ]]; then
-    log "build_external_deps_only.sh missing in $MOLTENVK_ROOT"
-    exit 1
-  fi
-  chmod +x ./build_external_deps_only.sh 2>/dev/null || true
-  log "Running ./build_external_deps_only.sh --ios --iossim ..."
-  if [[ ${#_tee_args[@]} -gt 0 ]]; then
-    ./build_external_deps_only.sh --ios --iossim 2>&1 | tee "${_tee_args[@]}"
-  else
-    ./build_external_deps_only.sh --ios --iossim
-  fi
-
-  log "Running make ios ..."
-  if [[ ${#_tee_args[@]} -gt 0 ]]; then
-    make ios 2>&1 | tee "${_tee_args[@]}"
-  else
-    make ios
-  fi
-  FOUND=$(find Package -name "libMoltenVK.a" -type f 2>/dev/null | head -1)
-  if [[ -z "$FOUND" ]]; then
-    log "libMoltenVK.a not found under Package/ after make ios"
-    exit 1
-  fi
-  # FOUND may be relative — resolve so cp always works
-  FOUND="$(cd "$(dirname "$FOUND")" && pwd)/$(basename "$FOUND")"
-  cp -f "$FOUND" "$OUT_LIB"
-  log "Copied $FOUND -> $OUT_LIB"
-  exit 0
+  log "No prebuilt available at $MANUAL_PREBUILT"
+  exit 1
 fi
 
-# Manual prebuilt only
-if [[ -f "$MANUAL_PREBUILT" ]]; then
-  cp -f "$MANUAL_PREBUILT" "$OUT_LIB"
-  log "Using manual prebuilt $MANUAL_PREBUILT -> $OUT_LIB"
-  exit 0
+# Shared MoltenVK build (serialized across all iOS toolchains via global lock).
+cd "$MOLTENVK_ROOT"
+if [[ ! -f "Makefile" || ! -d "MoltenVKPackaging.xcodeproj" ]]; then
+  log "MoltenVK root invalid: $MOLTENVK_ROOT"
+  exit 1
 fi
 
-log "no libMoltenVK.a. Either:"
-log "  1) Set moltenvk_ios_build_enabled=true, or"
-log "  2) Place libMoltenVK.a at prebuilt/ios/ (path was: $MANUAL_PREBUILT)"
-exit 1
+DEVICE_LIB="Package/Release/MoltenVK/static/MoltenVK.xcframework/ios-arm64/libMoltenVK.a"
+SIMULATOR_LIB="Package/Release/MoltenVK/static/MoltenVK.xcframework/ios-arm64_x86_64-simulator/libMoltenVK.a"
+
+_acquire_moltenvk_global_lock
+trap '_release_moltenvk_global_lock' EXIT
+
+# Re-check under lock (another toolchain may have finished while we waited).
+if [[ -f "$DEVICE_LIB" && -f "$SIMULATOR_LIB" ]]; then
+  log "Both libraries already exist, skipping build"
+else
+  log "Cleaning previous build..."
+  rm -rf Package/ External/build/
+
+  log "Running ./build_external_deps_only.sh --ios --iossim..."
+  ./build_external_deps_only.sh --ios --iossim
+
+  log "Building device (ios)..."
+  make ios
+  log "Building simulator (iossim)..."
+  make iossim
+fi
+
+_release_moltenvk_global_lock
+trap - EXIT
+
+# Verify the libraries exist
+if [[ ! -f "$DEVICE_LIB" ]]; then
+  log "Device library not found: $DEVICE_LIB"
+  exit 1
+fi
+if [[ ! -f "$SIMULATOR_LIB" ]]; then
+  log "Simulator library not found: $SIMULATOR_LIB"
+  exit 1
+fi
+
+# Copy the correct library for the target (thin simulator fat lib per TARGET_CPU).
+if [[ "$TARGET_TYPE" == "simulator" ]]; then
+  _lipo_arch="arm64"
+  if [[ "$TARGET_CPU" == "x64" ]]; then
+    _lipo_arch="x86_64"
+  fi
+  log "Using simulator library ($TARGET_CPU -> lipo -thin $_lipo_arch): $SIMULATOR_LIB"
+  _copy_moltenvk_out_lib "$SIMULATOR_LIB" "$_lipo_arch"
+else
+  log "Using device library: $DEVICE_LIB"
+  _copy_moltenvk_out_lib "$DEVICE_LIB" ""
+fi
+
+log "Copied to $OUT_LIB"
+
+log "Successfully built MoltenVK"

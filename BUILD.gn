@@ -11,36 +11,51 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# MoltenVK iOS: action always produces target_gen_dir/libMoltenVK.a so ninja has a
-# rule; prebuilt copies that into moltenvk_ios target_out_dir as libMoltenVK.a.
-#
-# moltenvk_ios_build_enabled=false + no manual .a => action fails with clear message.
-# Manual .a path: moltenvk_ios_prebuilt_a (repo path) is copied into gen by script.
-
 import("//build/ohos.gni")
 
 declare_args() {
   moltenvk_ios_prebuilt_a =
       "//third_party/MoltenVK/prebuilt/ios/libMoltenVK.a"
+  moltenvk_iossim_prebuilt_a =
+      "//third_party/MoltenVK/prebuilt/iossim/libMoltenVK.a"
   moltenvk_ios_build_enabled = true
   moltenvk_ios_rebuild_stamp = ""
 }
 
-# Stamp file only when build enabled or stamp non-empty — still write when empty so
-# changing stamp at gn gen invalidates action when build enabled.
+# Per-toolchain pool only; cross-toolchain serialization is in build_moltenvk_ios.sh.
+pool("moltenvk_build_pool") {
+  depth = 1
+}
+
+# Stamp file only when build enabled or stamp non-empty
 _moltenvk_stamp_file =
     "${root_build_dir}/build_configs/moltenvk_ios_rebuild_stamp.txt"
 write_file(_moltenvk_stamp_file, moltenvk_ios_rebuild_stamp)
 
 _moltenvk_root = "//third_party/MoltenVK"
 _moltenvk_root_rebased = rebase_path(_moltenvk_root, root_build_dir)
-_manual_prebuilt_rebased = rebase_path(moltenvk_ios_prebuilt_a, root_build_dir)
 _build_flag = "0"
 if (moltenvk_ios_build_enabled) {
   _build_flag = "1"
 }
 
-action("moltenvk_ios_build") {
+# Determine target type and prebuilt path based on build config
+if (use_ios_simulator) {
+  _target_type = "simulator"
+  _prebuilt_path = moltenvk_iossim_prebuilt_a
+} else {
+  _target_type = "device"
+  _prebuilt_path = moltenvk_ios_prebuilt_a
+}
+
+# Empty stamp must not be passed as "" — ninja/shell drops empty argv and shifts
+# TARGET_TYPE / BUILD_ENABLED (see build_moltenvk_ios.sh).
+_moltenvk_rebuild_stamp_arg = moltenvk_ios_rebuild_stamp
+if (_moltenvk_rebuild_stamp_arg == "") {
+  _moltenvk_rebuild_stamp_arg = "-"
+}
+
+action("moltenvk_build") {
   script = "//third_party/MoltenVK/build_moltenvk_ios.sh"
   inputs = [
     "//third_party/MoltenVK/build_moltenvk_ios.sh",
@@ -52,10 +67,13 @@ action("moltenvk_ios_build") {
   args = [
     _moltenvk_root_rebased,
     rebase_path("${target_gen_dir}/libMoltenVK.a", root_build_dir),
-    moltenvk_ios_rebuild_stamp,
+    _moltenvk_rebuild_stamp_arg,
     _build_flag,
-    _manual_prebuilt_rebased,
+    rebase_path(_prebuilt_path, root_build_dir),
+    _target_type,
+    current_cpu,
   ]
+  pool = ":moltenvk_build_pool"
 }
 
 config("moltenvk_public_config") {
@@ -64,17 +82,15 @@ config("moltenvk_public_config") {
   ]
 }
 
-# Copy from action output into stable out path; __config libs point at _copy_output.
-ohos_prebuilt_static_library("moltenvk_ios") {
-  source = get_label_info(":moltenvk_ios_build", "target_gen_dir") +
-           "/libMoltenVK.a"
+ohos_prebuilt_static_library("moltenvk") {
+  source = get_label_info(":moltenvk_build", "target_gen_dir") + "/libMoltenVK.a"
   output = "libMoltenVK.a"
-  deps = [ ":moltenvk_ios_build" ]
+  deps = [ ":moltenvk_build" ]
   public_configs = [ ":moltenvk_public_config" ]
   part_name = "build_framework"
   subsystem_name = "build"
 }
 
-group("moltenvk_ios_deps") {
-  public_deps = [ ":moltenvk_ios" ]
+group("moltenvk_deps") {
+  public_deps = [ ":moltenvk" ]
 }
