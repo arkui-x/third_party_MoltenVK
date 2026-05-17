@@ -1681,6 +1681,10 @@ bool MVKGraphicsPipeline::addFragmentShaderToPipeline(MTLRenderPipelineDescripto
 	return verifyImplicitBuffers(kMVKShaderStageFragment);
 }
 
+#if !MVK_XCODE_15
+static const NSUInteger MTLBufferLayoutStrideDynamic = NSUIntegerMax;
+#endif
+
 template<class T>
 bool MVKGraphicsPipeline::addVertexInputToPipeline(T* inputDesc,
 												   const VkPipelineVertexInputStateCreateInfo* pVI,
