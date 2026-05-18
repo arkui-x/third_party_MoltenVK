@@ -1,0 +1,12 @@
+[
+    {
+        "Name": "MoltenVK",
+        "License": "Apache-2.0",
+        "License File": "LICENSE",
+        "Version Number": "v1.4.1",
+        "Owner": "liwei@huawei.com",
+        "Upstream URL": "https://github.com/KhronosGroup/MoltenVK",
+        "Description": "MoltenVK is a implementation of an almost-complete subset of the Vulkan 1.4 graphics and compute API",
+        "Dependencies": [ "cereal", "Vulkan-Headers", "SPIRV-Cross", "SPIRV-Tools", "Vulkan-Tools", "Volk" ]
+    }
+]
