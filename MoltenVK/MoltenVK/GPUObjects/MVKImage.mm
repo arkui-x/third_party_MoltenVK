@@ -26,6 +26,7 @@
 #include "MVKOSExtensions.h"
 #include "MVKCodec.h"
 
+#import <CoreFoundation/CoreFoundation.h>
 #import "MTLSamplerDescriptor+MoltenVK.h"
 #import "CAMetalLayer+MoltenVK.h"
 
@@ -1534,6 +1535,24 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
 	if (signaler.fence) { signaler.fence->release(); }
 }
 
+#if MVK_IOS
+static void mvkRunCAMetalBlockOnMainThreadIfNeeded(bool drainRunLoop, dispatch_block_t block) {
+	if (@available(iOS 18, *)) {
+		mvkDispatchToMainAndWait(^{
+			block();
+			if (drainRunLoop) { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true); }
+		});
+	} else {
+		block();
+	}
+}
+#else
+static void mvkRunCAMetalBlockOnMainThreadIfNeeded(bool drainRunLoop, dispatch_block_t block) {
+	(void)drainRunLoop;
+	block();
+}
+#endif
+
 VkResult MVKPresentableSwapchainImage::acquireAndSignalWhenAvailable(MVKSemaphore* semaphore, MVKFence* fence) {
 
 	// Now that this image is being acquired, release the existing drawable and its texture.
@@ -1574,37 +1593,64 @@ VkResult MVKPresentableSwapchainImage::acquireAndSignalWhenAvailable(MVKSemaphor
 	return getConfigurationResult();
 }
 
+id<CAMetalDrawable> MVKPresentableSwapchainImage::acquireNextCAMetalDrawableFromLayer() {
+	__block id<CAMetalDrawable> acquired = nil;
+	mvkRunCAMetalBlockOnMainThreadIfNeeded(false, ^{
+		acquired = [_swapchain->getCAMetalLayer().nextDrawable retain];	// retained
+	});
+	return acquired;
+}
+
 // Calling nextDrawable may result in a nil drawable, or a drawable with no pixel format.
 // Attempt several times to retrieve a good drawable, and set an error to trigger the
 // swapchain to be re-established if one cannot be retrieved.
+void MVKPresentableSwapchainImage::tryAcquireCAMetalDrawable() {
+	@autoreleasepool {
+		bool hasInvalidFormat = false;
+		uint32_t attemptCnt = _swapchain->getImageCount();	// Attempt a resonable number of times
+		for (uint32_t attemptIdx = 0; !_mtlDrawable && attemptIdx < attemptCnt; attemptIdx++) {
+			uint64_t startTime = getPerformanceTimestamp();
+			_mtlDrawable = acquireNextCAMetalDrawableFromLayer();
+			addPerformanceInterval(getPerformanceStats().queue.retrieveCAMetalDrawable, startTime);
+			hasInvalidFormat = _mtlDrawable && !_mtlDrawable.texture.pixelFormat;
+			if (hasInvalidFormat) { releaseMetalDrawable(); }
+		}
+		if (hasInvalidFormat) {
+			setConfigurationResult(reportError(VK_ERROR_OUT_OF_DATE_KHR, "CAMetalDrawable with valid format could not be acquired after %d attempts.", attemptCnt));
+		} else if ( !_mtlDrawable ) {
+			setConfigurationResult(reportError(VK_ERROR_OUT_OF_POOL_MEMORY, "CAMetalDrawable could not be acquired after %d attempts.", attemptCnt));
+		}
+	}
+}
+
 id<CAMetalDrawable> MVKPresentableSwapchainImage::getCAMetalDrawable() {
 
 	if (_mtlTextureHeadless) { return nil; }	// If headless, there is no drawable.
 
-	if ( !_mtlDrawable ) {
-		@autoreleasepool {
-			bool hasInvalidFormat = false;
-			uint32_t attemptCnt = _swapchain->getImageCount();	// Attempt a resonable number of times
-			for (uint32_t attemptIdx = 0; !_mtlDrawable && attemptIdx < attemptCnt; attemptIdx++) {
-				uint64_t startTime = getPerformanceTimestamp();
-				_mtlDrawable = [_swapchain->getCAMetalLayer().nextDrawable retain];	// retained
-				addPerformanceInterval(getPerformanceStats().queue.retrieveCAMetalDrawable, startTime);
-				hasInvalidFormat = _mtlDrawable && !_mtlDrawable.texture.pixelFormat;
-				if (hasInvalidFormat) { releaseMetalDrawable(); }
-			}
-			if (hasInvalidFormat) {
-				setConfigurationResult(reportError(VK_ERROR_OUT_OF_DATE_KHR, "CAMetalDrawable with valid format could not be acquired after %d attempts.", attemptCnt));
-			} else if ( !_mtlDrawable ) {
-				setConfigurationResult(reportError(VK_ERROR_OUT_OF_POOL_MEMORY, "CAMetalDrawable could not be acquired after %d attempts.", attemptCnt));
-			}
-		}
-	}
+	if ( !_mtlDrawable ) { tryAcquireCAMetalDrawable(); }
 	return _mtlDrawable;
 }
 
 // If not headless, retrieve the MTLTexture directly from the CAMetalDrawable.
 id<MTLTexture> MVKPresentableSwapchainImage::getMTLTexture(uint8_t planeIndex) {
 	return _mtlTextureHeadless ? _mtlTextureHeadless : getCAMetalDrawable().texture;
+}
+
+void MVKPresentableSwapchainImage::performScheduledCAMetalPresent(id<CAMetalDrawable> mtlDrwbl,
+																  MVKImagePresentInfo presentInfo,
+																  MVKSwapchainSignaler signaler) {
+	addPresentedHandler(mtlDrwbl, presentInfo, signaler);
+
+	// Try to do any present mode transitions as late as possible in an attempt
+	// to avoid visual disruptions on any presents already on the queue.
+	if (presentInfo.presentMode != VK_PRESENT_MODE_MAX_ENUM_KHR) {
+		mtlDrwbl.layer.displaySyncEnabledMVK = (presentInfo.presentMode != VK_PRESENT_MODE_IMMEDIATE_KHR);
+	}
+	if (presentInfo.desiredPresentTime) {
+		[mtlDrwbl presentAtTime: (double)presentInfo.desiredPresentTime * 1.0e-9];
+	} else {
+		[mtlDrwbl present];
+	}
 }
 
 // Present the drawable and make myself available only once the command buffer has completed.
@@ -1620,19 +1666,10 @@ VkResult MVKPresentableSwapchainImage::presentCAMetalDrawable(id<MTLCommandBuffe
 	id<CAMetalDrawable> mtlDrwbl = getCAMetalDrawable();
 	MVKSwapchainSignaler signaler = getPresentationSignaler();
 	[mtlCmdBuff addScheduledHandler: ^(id<MTLCommandBuffer> mcb) {
-
-		addPresentedHandler(mtlDrwbl, presentInfo, signaler);
-
-		// Try to do any present mode transitions as late as possible in an attempt
-		// to avoid visual disruptions on any presents already on the queue.
-		if (presentInfo.presentMode != VK_PRESENT_MODE_MAX_ENUM_KHR) {
-			mtlDrwbl.layer.displaySyncEnabledMVK = (presentInfo.presentMode != VK_PRESENT_MODE_IMMEDIATE_KHR);
-		}
-		if (presentInfo.desiredPresentTime) {
-			[mtlDrwbl presentAtTime: (double)presentInfo.desiredPresentTime * 1.0e-9];
-		} else {
-			[mtlDrwbl present];
-		}
+		// vkQueuePresentKHR may run on the main thread, but the scheduled handler does not.
+		mvkRunCAMetalBlockOnMainThreadIfNeeded(true, ^{
+			performScheduledCAMetalPresent(mtlDrwbl, presentInfo, signaler);
+		});
 	}];
 
 	// Ensure this image, the drawable, and the present fence are not destroyed while
@@ -1648,7 +1685,7 @@ VkResult MVKPresentableSwapchainImage::presentCAMetalDrawable(id<MTLCommandBuffe
 	[mtlCmdBuff addCompletedHandler: ^(id<MTLCommandBuffer> mcb) {
 		signal(fence);
 		if (fence) { fence->release(); }
-		[mtlDrwbl release];
+		mvkRunCAMetalBlockOnMainThreadIfNeeded(true, ^{ [mtlDrwbl release]; });
 		release();
 		if (_swapchain) { _swapchain->notifyPresentComplete(presentInfo); }
 	}];
@@ -1732,8 +1769,10 @@ void MVKPresentableSwapchainImage::endPresentation(const MVKImagePresentInfo& pr
 
 // Releases the CAMetalDrawable underlying this image.
 void MVKPresentableSwapchainImage::releaseMetalDrawable() {
-    [_mtlDrawable release];
+	if ( !_mtlDrawable ) { return; }
+	__block id<CAMetalDrawable> drawable = _mtlDrawable;
 	_mtlDrawable = nil;
+	mvkRunCAMetalBlockOnMainThreadIfNeeded(false, ^{ [drawable release]; });
 }
 
 // Signal, untrack, and release any signalers that are tracking.
