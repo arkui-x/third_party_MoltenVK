@@ -500,10 +500,9 @@ protected:
 
 	id<CAMetalDrawable> getCAMetalDrawable();
 	id<CAMetalDrawable> acquireNextCAMetalDrawableFromLayer();
-	void tryAcquireCAMetalDrawable();
-	void performScheduledCAMetalPresent(id<CAMetalDrawable> mtlDrwbl,
-										MVKImagePresentInfo presentInfo,
-										MVKSwapchainSignaler signaler);
+    void tryAcquireCAMetalDrawable();
+    void performScheduledCAMetalPresent(id<CAMetalDrawable> mtlDrwbl,
+        MVKImagePresentInfo presentInfo, MVKSwapchainSignaler signaler);
 	void addPresentedHandler(id<CAMetalDrawable> mtlDrawable, MVKImagePresentInfo presentInfo, MVKSwapchainSignaler signaler);
 	void releaseMetalDrawable();
 	MVKSwapchainImageAvailability getAvailability();

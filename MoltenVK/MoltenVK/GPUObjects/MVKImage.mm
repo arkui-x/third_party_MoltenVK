@@ -1647,7 +1647,7 @@ void MVKPresentableSwapchainImage::performScheduledCAMetalPresent(id<CAMetalDraw
 		mtlDrwbl.layer.displaySyncEnabledMVK = (presentInfo.presentMode != VK_PRESENT_MODE_IMMEDIATE_KHR);
 	}
 	if (presentInfo.desiredPresentTime) {
-		[mtlDrwbl presentAtTime: (double)presentInfo.desiredPresentTime * 1.0e-9];
+		[mtlDrwbl presentAtTime: static_cast<double>(presentInfo.desiredPresentTime) * 1.0e-9];
 	} else {
 		[mtlDrwbl present];
 	}
