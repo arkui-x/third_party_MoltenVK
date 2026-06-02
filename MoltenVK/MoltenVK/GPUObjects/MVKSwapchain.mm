@@ -26,6 +26,7 @@
 #include "MVKWatermarkTextureContent.h"
 #include "MVKWatermarkShaderSource.h"
 #include "mvk_datatypes.hpp"
+#include <CoreFoundation/CoreFoundation.h>
 #include <libkern/OSByteOrder.h>
 
 #import "CAMetalLayer+MoltenVK.h"
@@ -291,6 +292,15 @@ void MVKSwapchain::notifyPresentComplete(const MVKImagePresentInfo& presentInfo)
 // The drawableSize will be set to a correct size by the next swapchain created on the same surface.
 void MVKSwapchain::forceUnpresentedImageCompletion() {
 	if (_unpresentedImageCount) {
+#if MVK_IOS
+		if (@available(iOS 18, *)) {
+			mvkDispatchToMainAndWait(^{
+				getCAMetalLayer().drawableSize = { 1, 1 };
+				CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true);
+			});
+			return;
+		}
+#endif
 		getCAMetalLayer().drawableSize = { 1,1 };
 	}
 }
