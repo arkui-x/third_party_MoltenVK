@@ -229,13 +229,38 @@ void MVKQueue::handleMTLCommandBufferError(id<MTLCommandBuffer> mtlCmdBuff) {
 	bool markPhysicalDeviceLoss = false;
 	switch (mtlCmdBuff.error.code) {
 		case MTLCommandBufferErrorBlacklisted:
-		case MTLCommandBufferErrorNotPermitted:	// May also be used for command buffers executed in the background without the right entitlement.
 #if MVK_MACOS && !MVK_MACCAT
 		case MTLCommandBufferErrorDeviceRemoved:
 #endif
 			vkErr = VK_ERROR_DEVICE_LOST;
 			markDeviceLoss = true;
 			markPhysicalDeviceLoss = true;
+			break;
+		case MTLCommandBufferErrorNotPermitted:	// May also be used for command buffers executed in the background without the right entitlement.
+			// iOS aborts command buffers submitted while the app is backgrounded
+			// (kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted).
+			// This is a policy rejection, not a device fault: the command buffer never
+			// executed, the MTLDevice remains healthy, and rendering works again once
+			// the app returns to the foreground. Marking the VkDevice lost here leaves
+			// every subsequent call returning a sticky VK_ERROR_DEVICE_LOST, which
+			// aborts the app in Skia GrVkGpu::checkVkResult on the first foreground
+			// frame. Instead, release the CPU-side semaphore waiters registered by
+			// this device (the aborted work will never signal them) and keep the
+			// device usable.
+			// ARKUI_DISABLE_BG_REJECT_RECOVERY=1 restores the pre-fix behaviour (mark
+			// the device lost) for A/B tests of the background-execution crash chain.
+			{
+				static const bool disableBgRejectRecovery = getenv("ARKUI_DISABLE_BG_REJECT_RECOVERY") != nullptr;
+				if (disableBgRejectRecovery) {
+					vkErr = VK_ERROR_DEVICE_LOST;
+					markDeviceLoss = true;
+					markPhysicalDeviceLoss = true;
+				} else {
+					vkErr = VK_ERROR_SURFACE_LOST_KHR;
+					markDeviceLoss = false;
+					getDevice()->unstickAwaitingSemaphores();
+				}
+			}
 			break;
 		case MTLCommandBufferErrorTimeout:
 			vkErr = VK_TIMEOUT;

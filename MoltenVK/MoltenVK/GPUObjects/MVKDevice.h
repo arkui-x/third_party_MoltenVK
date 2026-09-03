@@ -678,6 +678,14 @@ public:
 	/** Mark this device (and optionally the physical device) as lost. Releases all waits for this device. */
 	VkResult markLost(bool alsoMarkPhysicalDevice = false);
 
+	/**
+	 * Releases all waits for this device without marking the device as lost.
+	 * Used when command buffers are rejected for policy reasons (e.g. GPU work
+	 * submitted while the app is backgrounded on iOS): the aborted work will
+	 * never signal its semaphores, but the device itself remains usable.
+	 */
+	void unstickAwaitingSemaphores();
+
 	/** Returns whether or not the given descriptor set layout is supported. */
 	void getDescriptorSetLayoutSupport(const VkDescriptorSetLayoutCreateInfo* pCreateInfo,
 									   VkDescriptorSetLayoutSupport* pSupport);
