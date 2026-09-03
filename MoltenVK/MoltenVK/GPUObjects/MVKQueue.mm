@@ -262,9 +262,26 @@ void MVKQueue::handleMTLCommandBufferError(id<MTLCommandBuffer> mtlCmdBuff) {
 				}
 			}
 			break;
-		case MTLCommandBufferErrorTimeout:
+		case MTLCommandBufferErrorTimeout: {
+			// The Metal execution watchdog (kIOGPUCommandBufferCallbackErrorTimeout) kills the
+			// ONE command buffer that overran its budget; the GPU itself keeps running. Upstream
+			// leaves markDeviceLoss at !resumeLostDevice (true by default), which sticks
+			// VK_ERROR_DEVICE_LOST on every subsequent call and aborts the app in Skia
+			// checkVkResult at the next wait/submit (device 9-03 heavy video scroll: watchdog
+			// killed one vkQueueSubmit buffer, WaitForFences returned -4, app died). Treat it
+			// as a per-buffer event instead: the submission's own completion path still runs
+			// finish() on error completions and signals its fence, and unstickAwaitingSemaphores
+			// releases any GPU semaphore waits whose signal encodings died with the buffer.
+			// ARKUI_DISABLE_GPU_TIMEOUT_RECOVERY=1 restores the pre-fix behaviour (mark the
+			// device lost) for A/B tests.
+			static const bool disableTimeoutRecovery = getenv("ARKUI_DISABLE_GPU_TIMEOUT_RECOVERY") != nullptr;
+			if (!disableTimeoutRecovery) {
+				markDeviceLoss = false;
+				getDevice()->unstickAwaitingSemaphores();
+			}
 			vkErr = VK_TIMEOUT;
 			break;
+		}
 		case MTLCommandBufferErrorStackOverflow:
 		case MTLCommandBufferErrorPageFault:
 		case MTLCommandBufferErrorOutOfMemory:
