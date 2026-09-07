@@ -247,20 +247,9 @@ void MVKQueue::handleMTLCommandBufferError(id<MTLCommandBuffer> mtlCmdBuff) {
 			// frame. Instead, release the CPU-side semaphore waiters registered by
 			// this device (the aborted work will never signal them) and keep the
 			// device usable.
-			// ARKUI_DISABLE_BG_REJECT_RECOVERY=1 restores the pre-fix behaviour (mark
-			// the device lost) for A/B tests of the background-execution crash chain.
-			{
-				static const bool disableBgRejectRecovery = getenv("ARKUI_DISABLE_BG_REJECT_RECOVERY") != nullptr;
-				if (disableBgRejectRecovery) {
-					vkErr = VK_ERROR_DEVICE_LOST;
-					markDeviceLoss = true;
-					markPhysicalDeviceLoss = true;
-				} else {
-					vkErr = VK_ERROR_SURFACE_LOST_KHR;
-					markDeviceLoss = false;
-					getDevice()->unstickAwaitingSemaphores();
-				}
-			}
+			vkErr = VK_ERROR_SURFACE_LOST_KHR;
+			markDeviceLoss = false;
+			getDevice()->unstickAwaitingSemaphores();
 			break;
 		case MTLCommandBufferErrorTimeout: {
 			// The Metal execution watchdog (kIOGPUCommandBufferCallbackErrorTimeout) kills the
@@ -272,13 +261,8 @@ void MVKQueue::handleMTLCommandBufferError(id<MTLCommandBuffer> mtlCmdBuff) {
 			// as a per-buffer event instead: the submission's own completion path still runs
 			// finish() on error completions and signals its fence, and unstickAwaitingSemaphores
 			// releases any GPU semaphore waits whose signal encodings died with the buffer.
-			// ARKUI_DISABLE_GPU_TIMEOUT_RECOVERY=1 restores the pre-fix behaviour (mark the
-			// device lost) for A/B tests.
-			static const bool disableTimeoutRecovery = getenv("ARKUI_DISABLE_GPU_TIMEOUT_RECOVERY") != nullptr;
-			if (!disableTimeoutRecovery) {
-				markDeviceLoss = false;
-				getDevice()->unstickAwaitingSemaphores();
-			}
+			markDeviceLoss = false;
+			getDevice()->unstickAwaitingSemaphores();
 			vkErr = VK_TIMEOUT;
 			break;
 		}
