@@ -3845,6 +3845,24 @@ VkResult MVKDevice::markLost(bool alsoMarkPhysicalDevice) {
 	return getConfigurationResult();
 }
 
+// The semaphore-release half of markLost(), without the sticky VK_ERROR_DEVICE_LOST:
+// command buffers aborted by iOS background-execution policy never signal, so their
+// CPU-side waiters must be released, but the device itself stays usable.
+void MVKDevice::unstickAwaitingSemaphores() {
+	lock_guard<mutex> lock(_sem4Lock);
+
+	for (auto* sem4 : _awaitingSemaphores) {
+		sem4->release();
+	}
+	for (auto& sem4AndValue : _awaitingTimelineSem4s) {
+		VkSemaphoreSignalInfo signalInfo = {};	// sType/pNext are unread today; don't pass garbage.
+		signalInfo.value = sem4AndValue.second;
+		sem4AndValue.first->signal(&signalInfo);
+	}
+	_awaitingSemaphores.clear();
+	_awaitingTimelineSem4s.clear();
+}
+
 void MVKDevice::getDescriptorSetLayoutSupport(const VkDescriptorSetLayoutCreateInfo* pCreateInfo,
 											  VkDescriptorSetLayoutSupport* pSupport) {
 	// According to the Vulkan spec:

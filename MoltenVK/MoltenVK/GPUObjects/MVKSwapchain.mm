@@ -292,12 +292,62 @@ void MVKSwapchain::notifyPresentComplete(const MVKImagePresentInfo& presentInfo)
 // The drawableSize will be set to a correct size by the next swapchain created on the same surface.
 void MVKSwapchain::forceUnpresentedImageCompletion() {
 	if (_unpresentedImageCount) {
+		MVKLogInfo("Forcing completion of %u uncompleted presentation(s).", _unpresentedImageCount.load());
 #if MVK_IOS
 		if (@available(iOS 18, *)) {
-			mvkDispatchToMainAndWait(^{
+			// The {1,1} resize only force-completes presentations once CA commits it, which
+			// needs real runloop turns — a zero-budget drain does not commit anything. Pump
+			// with a small real budget after resizing. Off the main thread, BOUNDED-wait for
+			// the block instead of fire-and-forget: nobody pumps the runloop after destroy
+			// returns, so a resize that is merely queued never commits, and the pinned
+			// drawables (their IOSurfaces) leak. An unbounded dispatch_sync could deadlock
+			// against a main thread blocked on the app's render mutex, hence the timeout:
+			// on expiry the block still runs later, we just stop waiting. Do not capture
+			// `this` — this swapchain may be freed before the block runs.
+			if (NSThread.isMainThread) {
 				getCAMetalLayer().drawableSize = { 1, 1 };
-				CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true);
+				for (int pumpIdx = 0; pumpIdx < 3 && _unpresentedImageCount; pumpIdx++) {
+					CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, true);
+				}
+				MVKLogInfo("Force-completion finished on main; %u presentation(s) remain uncompleted.",
+						   _unpresentedImageCount.load());
+				return;
+			}
+			CAMetalLayer* mtlLayer = getCAMetalLayer();
+			// Snapshot the size this swapchain left the layer at: if the block runs LATE
+			// (busy main outlasted the 250ms bound), a successor swapchain may already have
+			// reconfigured the same layer, and stomping {1,1} onto it would break the new
+			// swapchain's rendering until its next recreate. Only apply the force-completion
+			// resize while the layer still shows OUR size.
+			CGSize prevLayerSize = mtlLayer.drawableSize;
+			dispatch_semaphore_t done = dispatch_semaphore_create(0);
+			dispatch_async(dispatch_get_main_queue(), ^{
+				if ( !CGSizeEqualToSize(mtlLayer.drawableSize, prevLayerSize) ) {
+					MVKLogInfo("Skipping late force-completion resize: layer was reconfigured by a new swapchain.");
+					dispatch_semaphore_signal(done);
+					return;
+				}
+				mtlLayer.drawableSize = { 1, 1 };
+				for (int pumpIdx = 0; pumpIdx < 3; pumpIdx++) {
+					CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, true);
+				}
+				// Don't leave {1,1} behind: whoever owns the layer next (a recreated
+				// swapchain on this same layer) expects the size it set. Restoring ours is
+				// a no-op if a successor already changed it during the pumps.
+				if ( CGSizeEqualToSize(mtlLayer.drawableSize, CGSizeMake(1, 1)) ) {
+					mtlLayer.drawableSize = prevLayerSize;
+				}
+				dispatch_semaphore_signal(done);
 			});
+			bool finished = dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC)) == 0;
+			dispatch_release(done);
+			if (finished) {
+				MVKLogInfo("Force-completion finished; %u presentation(s) remain uncompleted.",
+						   _unpresentedImageCount.load());
+			} else {
+				MVKLogInfo("Force-completion still pending on busy main thread; %u presentation(s) remain uncompleted.",
+						   _unpresentedImageCount.load());
+			}
 			return;
 		}
 #endif

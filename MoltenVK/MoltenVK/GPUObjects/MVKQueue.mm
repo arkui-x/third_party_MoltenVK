@@ -229,7 +229,6 @@ void MVKQueue::handleMTLCommandBufferError(id<MTLCommandBuffer> mtlCmdBuff) {
 	bool markPhysicalDeviceLoss = false;
 	switch (mtlCmdBuff.error.code) {
 		case MTLCommandBufferErrorBlacklisted:
-		case MTLCommandBufferErrorNotPermitted:	// May also be used for command buffers executed in the background without the right entitlement.
 #if MVK_MACOS && !MVK_MACCAT
 		case MTLCommandBufferErrorDeviceRemoved:
 #endif
@@ -237,9 +236,36 @@ void MVKQueue::handleMTLCommandBufferError(id<MTLCommandBuffer> mtlCmdBuff) {
 			markDeviceLoss = true;
 			markPhysicalDeviceLoss = true;
 			break;
-		case MTLCommandBufferErrorTimeout:
+		case MTLCommandBufferErrorNotPermitted:	// May also be used for command buffers executed in the background without the right entitlement.
+			// iOS aborts command buffers submitted while the app is backgrounded
+			// (kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted).
+			// This is a policy rejection, not a device fault: the command buffer never
+			// executed, the MTLDevice remains healthy, and rendering works again once
+			// the app returns to the foreground. Marking the VkDevice lost here leaves
+			// every subsequent call returning a sticky VK_ERROR_DEVICE_LOST, which
+			// aborts the app in Skia GrVkGpu::checkVkResult on the first foreground
+			// frame. Instead, release the CPU-side semaphore waiters registered by
+			// this device (the aborted work will never signal them) and keep the
+			// device usable.
+			vkErr = VK_ERROR_SURFACE_LOST_KHR;
+			markDeviceLoss = false;
+			getDevice()->unstickAwaitingSemaphores();
+			break;
+		case MTLCommandBufferErrorTimeout: {
+			// The Metal execution watchdog (kIOGPUCommandBufferCallbackErrorTimeout) kills the
+			// ONE command buffer that overran its budget; the GPU itself keeps running. Upstream
+			// leaves markDeviceLoss at !resumeLostDevice (true by default), which sticks
+			// VK_ERROR_DEVICE_LOST on every subsequent call and aborts the app in Skia
+			// checkVkResult at the next wait/submit (device 9-03 heavy video scroll: watchdog
+			// killed one vkQueueSubmit buffer, WaitForFences returned -4, app died). Treat it
+			// as a per-buffer event instead: the submission's own completion path still runs
+			// finish() on error completions and signals its fence, and unstickAwaitingSemaphores
+			// releases any GPU semaphore waits whose signal encodings died with the buffer.
+			markDeviceLoss = false;
+			getDevice()->unstickAwaitingSemaphores();
 			vkErr = VK_TIMEOUT;
 			break;
+		}
 		case MTLCommandBufferErrorStackOverflow:
 		case MTLCommandBufferErrorPageFault:
 		case MTLCommandBufferErrorOutOfMemory:
