@@ -1583,15 +1583,22 @@ VkResult MVKPresentableSwapchainImage::acquireAndSignalWhenAvailable(MVKSemaphor
 	// beginMetalRenderPass. Failing here instead lets the app skip the frame and retry when
 	// the main thread frees up. The error is returned directly and NOT via
 	// setConfigurationResult(), which is sticky and would poison this image permanently.
-	if ( !_mtlTextureHeadless ) {
-		uint32_t attemptCnt = _swapchain->getImageCount();	// Retry to cover transient gaps
-		for (uint32_t attemptIdx = 0; !_mtlDrawable && attemptIdx < attemptCnt; attemptIdx++) {
-			_mtlDrawable = acquireNextCAMetalDrawableFromLayer();
-			if (_mtlDrawable && !_mtlDrawable.texture.pixelFormat) { releaseMetalDrawable(); }	// Unusable — retry
-		}
-		if ( !_mtlDrawable ) {
-			MVKLogWarn("Deferring acquisition of swapchain image %u — CAMetalDrawable unavailable.", _swapchainIndex);
-			return VK_ERROR_OUT_OF_POOL_MEMORY;
+	// iOS 18 ONLY: on iOS 17 and below the eager nextDrawable strands the layer's whole
+	// drawable pool — device 9-09 A/B on iOS 17: with eager acquisition every drag window
+	// AND every rotation pinned its 3-drawable IOSurface pool, while the lazy path (the
+	// pre-existing behaviour) releases cleanly; the bounded-wait timeout the eager path
+	// guards against is itself iOS 18-only.
+	if (@available(iOS 18, *)) {
+		if ( !_mtlTextureHeadless ) {
+			uint32_t attemptCnt = _swapchain->getImageCount();	// Retry to cover transient gaps
+			for (uint32_t attemptIdx = 0; !_mtlDrawable && attemptIdx < attemptCnt; attemptIdx++) {
+				_mtlDrawable = acquireNextCAMetalDrawableFromLayer();
+				if (_mtlDrawable && !_mtlDrawable.texture.pixelFormat) { releaseMetalDrawable(); }	// Unusable — retry
+			}
+			if ( !_mtlDrawable ) {
+				MVKLogWarn("Deferring acquisition of swapchain image %u — CAMetalDrawable unavailable.", _swapchainIndex);
+				return VK_ERROR_OUT_OF_POOL_MEMORY;
+			}
 		}
 	}
 
