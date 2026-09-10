@@ -1536,12 +1536,22 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
 }
 
 #if MVK_IOS
+// On iOS 18+, CAMetalLayer drawable operations must run on the main thread. These blocks return
+// no results, so use fire-and-forget dispatch: waiting here (dispatch_sync) blocks a Metal
+// completion thread on a busy main thread — stalling command-buffer completion and any
+// vkDeviceWaitIdle behind it — or blocks the app render thread while it holds the render mutex,
+// which deadlocks against a main thread waiting on that same mutex.
 static void mvkRunCAMetalBlockOnMainThreadIfNeeded(bool drainRunLoop, dispatch_block_t block) {
 	if (@available(iOS 18, *)) {
-		mvkDispatchToMainAndWait(^{
+		if (NSThread.isMainThread) {
 			block();
 			if (drainRunLoop) { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true); }
-		});
+		} else {
+			dispatch_async(dispatch_get_main_queue(), ^{
+				block();
+				if (drainRunLoop) { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true); }
+			});
+		}
 	} else {
 		block();
 	}
@@ -1564,6 +1574,33 @@ VkResult MVKPresentableSwapchainImage::acquireAndSignalWhenAvailable(MVKSemaphor
 	// Upon acquisition, update acquisition ID immediately, to move it to the back of the chain,
 	// so other images will be preferred if either all images are available or no images are available.
 	_availability.acquisitionID = _swapchain->getNextAcquisitionID();
+
+	// Eagerly secure the CAMetal drawable here, in both availability cases, BEFORE reporting
+	// success to the app. Fetching it lazily at first getMTLTexture() is too late: by then
+	// vkAcquireNextImageKHR has already returned success, and a nil drawable (bounded
+	// nextDrawable wait timed out against a busy main thread, or the app is backgrounded)
+	// hands a nil MTLTexture to the command encoder, which Metal fatally asserts on inside
+	// beginMetalRenderPass. Failing here instead lets the app skip the frame and retry when
+	// the main thread frees up. The error is returned directly and NOT via
+	// setConfigurationResult(), which is sticky and would poison this image permanently.
+	// iOS 18 ONLY: on iOS 17 and below the eager nextDrawable strands the layer's whole
+	// drawable pool — device 9-09 A/B on iOS 17: with eager acquisition every drag window
+	// AND every rotation pinned its 3-drawable IOSurface pool, while the lazy path (the
+	// pre-existing behaviour) releases cleanly; the bounded-wait timeout the eager path
+	// guards against is itself iOS 18-only.
+	if (@available(iOS 18, *)) {
+		if ( !_mtlTextureHeadless ) {
+			uint32_t attemptCnt = _swapchain->getImageCount();	// Retry to cover transient gaps
+			for (uint32_t attemptIdx = 0; !_mtlDrawable && attemptIdx < attemptCnt; attemptIdx++) {
+				_mtlDrawable = acquireNextCAMetalDrawableFromLayer();
+				if (_mtlDrawable && !_mtlDrawable.texture.pixelFormat) { releaseMetalDrawable(); }	// Unusable — retry
+			}
+			if ( !_mtlDrawable ) {
+				MVKLogWarn("Deferring acquisition of swapchain image %u — CAMetalDrawable unavailable.", _swapchainIndex);
+				return VK_ERROR_OUT_OF_POOL_MEMORY;
+			}
+		}
+	}
 
 	auto signaler = MVKSwapchainSignaler{fence, semaphore, semaphore ? semaphore->deferSignal() : 0};
 	if (_availability.isAvailable) {
@@ -1594,11 +1631,36 @@ VkResult MVKPresentableSwapchainImage::acquireAndSignalWhenAvailable(MVKSemaphor
 }
 
 id<CAMetalDrawable> MVKPresentableSwapchainImage::acquireNextCAMetalDrawableFromLayer() {
-	__block id<CAMetalDrawable> acquired = nil;
-	mvkRunCAMetalBlockOnMainThreadIfNeeded(false, ^{
-		acquired = [_swapchain->getCAMetalLayer().nextDrawable retain];	// retained
-	});
-	return acquired;
+	// On iOS 18+, nextDrawable must run on the main thread, and its result is needed here. Use a
+	// BOUNDED wait: an unbounded dispatch_sync deadlocks when the main thread is blocked on the
+	// app's render-thread mutex while the render thread (holding that mutex) waits inside this
+	// call. On timeout, return nil — callers retry, then error out and re-establish the swapchain
+	// cleanly — and the late-arriving drawable is released from a follow-up block on the same
+	// serial main queue, which is guaranteed to run after the acquire block itself.
+	if (@available(iOS 18, *)) {
+		if (NSThread.isMainThread) {
+			id<CAMetalDrawable> drw = [_swapchain->getCAMetalLayer().nextDrawable retain];	// retained
+			return drw;
+		}
+		CAMetalLayer* mtlLayer = _swapchain->getCAMetalLayer();
+		__block id<CAMetalDrawable> acquired = nil;
+		dispatch_semaphore_t done = dispatch_semaphore_create(0);
+		dispatch_async(dispatch_get_main_queue(), ^{
+			acquired = [mtlLayer.nextDrawable retain];	// retained
+			dispatch_semaphore_signal(done);
+		});
+		bool gotDrawable = dispatch_semaphore_wait(done,
+									dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC)) == 0;
+		dispatch_release(done);
+		if (gotDrawable) { return acquired; }
+		dispatch_async(dispatch_get_main_queue(), ^{
+			// runs after the acquire block (serial queue)
+			if (acquired) { [acquired release]; }
+		});
+		return nil;
+	}
+	id<CAMetalDrawable> drw = [_swapchain->getCAMetalLayer().nextDrawable retain];	// retained
+	return drw;
 }
 
 // Calling nextDrawable may result in a nil drawable, or a drawable with no pixel format.
@@ -1667,8 +1729,36 @@ VkResult MVKPresentableSwapchainImage::presentCAMetalDrawable(id<MTLCommandBuffe
 	MVKSwapchainSignaler signaler = getPresentationSignaler();
 	[mtlCmdBuff addScheduledHandler: ^(id<MTLCommandBuffer> mcb) {
 		// vkQueuePresentKHR may run on the main thread, but the scheduled handler does not.
+		// iOS rejects GPU work submitted while the app is backgrounded
+		// (kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted) — including this
+		// present's own command buffer — and the error is already set by the time this
+		// scheduled handler runs. The render pass that should have filled the drawable was
+		// rejected the same way, so presenting here would composite a never-written drawable:
+		// the user sees one frame of recycled IOSurface garbage when returning to the
+		// foreground. Skip the present; image recycling is driven by the completed handler
+		// below, which runs regardless of the error, and the presented-handler stats simply
+		// never start.
+		if (mcb.error) {
+			MVKLogWarn("Skipping present of drawable on failed command buffer (error %ld) — rendering was rejected, never composited.", (long)mcb.error.code);
+			// The acquire-side signaler was already pulled off this image's waiters by
+			// getPresentationSignaler() above; with the present skipped it would never be
+			// signaled — signaling normally rides endPresentation() via the presented handler
+			// this branch skips — so the app's vkAcquireNextImageKHR fence/semaphore would
+			// hang until the swapchain is destroyed (makeAvailable() as the only backstop).
+			// Signal it here; fences/semaphores tolerate the redundant signal when this is
+			// the pre-signaler of an already-available image.
+			signalAndUntrack(signaler);
+			return;
+		}
+		// The block may outlive this image: on a busy main queue the bounded wait inside
+		// mvkRunCAMetalBlockOnMainThreadIfNeeded can expire while the block is still queued,
+		// and the completed handler below may then release() the final reference before the
+		// block runs. Hold one reference for the block's duration — performScheduledCAMetalPresent
+		// begins a presentation, which retains again until its presented handler ends it.
+		retain();
 		mvkRunCAMetalBlockOnMainThreadIfNeeded(true, ^{
 			performScheduledCAMetalPresent(mtlDrwbl, presentInfo, signaler);
+			release();
 		});
 	}];
 
